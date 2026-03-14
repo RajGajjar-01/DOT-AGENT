@@ -1,15 +1,17 @@
-﻿using DotNetEnv;
+using DotNetEnv;
 using DotAgent.Data;
+using DotAgent.Services;
+using DotAgent.Orchestrator;
 using Spectre.Console;
 
 // ── Bootstrap ─────────────────────────────────────────────────────
 Env.Load();
-var db = new Database();
+var db     = new Database();
+var llm    = new LlmService();
+var shell  = new ShellExecutor();
+var agent  = new AgentOrchestrator(db, llm, shell);
 
-var llm = new DotAgent.Services.LlmService();
-AnsiConsole.MarkupLine("  [green]✓[/] LlmService initialised");
-
-// ── Top padding ───────────────────────────────────────────────────
+// ── Banner ────────────────────────────────────────────────────────
 AnsiConsole.WriteLine();
 AnsiConsole.WriteLine();
 
@@ -42,18 +44,8 @@ for (int i = 0; i < lines.Length; i++)
 
 AnsiConsole.WriteLine();
 AnsiConsole.Write(new Markup(
-    "  [dim]AI Agent powered by [/][bold cyan]GLM-4.7-Flash[/][dim] · Z.ai · SQLite[/]"));
+    "  [dim]AI Agent powered by [/][bold #F0AA00]GLM-4-Flash[/][dim] · Z.ai · SQLite[/]"));
 AnsiConsole.WriteLine();
-AnsiConsole.WriteLine();
-
-AnsiConsole.Write(new Rule().RuleStyle("cyan dim"));
-AnsiConsole.WriteLine();
-
-AnsiConsole.MarkupLine("  [dim]Model[/]    [cyan]glm-4.7-flash[/]");
-AnsiConsole.MarkupLine("  [dim]Storage[/]  [cyan]SQLite · agent.db[/]");
-AnsiConsole.MarkupLine("  [dim]Shell[/]    [cyan]bash[/]");
-AnsiConsole.WriteLine();
-AnsiConsole.Write(new Rule().RuleStyle("cyan dim"));
 AnsiConsole.WriteLine();
 
 // ── Main menu loop ────────────────────────────────────────────────
@@ -61,53 +53,95 @@ while (true)
 {
     var choice = AnsiConsole.Prompt(
         new SelectionPrompt<string>()
-            .Title("  [cyan]What do you want to do?[/]")
-            .HighlightStyle(Style.Parse("cyan bold"))
-            .AddChoices("New Chat", "Load Session", "Exit")
+            .Title("  [bold #F0AA00]What do you want to do?[/]")
+            .HighlightStyle(Style.Parse("bold #F0AA00"))
+            .AddChoices("⊕  New Chat", "↻  Load Session", "✕  Exit")
     );
 
     AnsiConsole.WriteLine();
 
     switch (choice)
     {
-        case "New Chat":
-            AnsiConsole.MarkupLine("  [cyan]›[/] [dim]Starting new session... (wired in Step 5)[/]");
+        case "⊕  New Chat":
+            try
+            {
+                await agent.RunNewSessionAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                AnsiConsole.MarkupLine("  [dim]Session interrupted.[/]");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"  [red]Error:[/] {Markup.Escape(ex.Message)}");
+            }
             AnsiConsole.WriteLine();
             break;
 
-        case "Load Session":
+        case "↻  Load Session":
             var sessions = db.ListSessions().ToList();
+
             if (sessions.Count == 0)
             {
                 AnsiConsole.MarkupLine("  [dim]No sessions yet. Start a new chat first.[/]");
+                AnsiConsole.WriteLine();
+                break;
             }
-            else
-            {
-                var table = new Table()
-                    .Border(TableBorder.Rounded)
-                    .BorderColor(Color.Grey)
-                    .AddColumn("[dim]ID[/]")
-                    .AddColumn("[dim]Title[/]")
-                    .AddColumn("[dim]Status[/]")
-                    .AddColumn("[dim]Last active[/]");
 
-                foreach (var s in sessions)
-                {
-                    var dt = DateTimeOffset.FromUnixTimeSeconds(s.UpdatedAt)
-                        .LocalDateTime.ToString("MMM dd HH:mm");
-                    table.AddRow(
-                        $"[cyan]{s.Id[..8]}[/]",
-                        s.Title,
-                        s.Status == "active" ? "[green]active[/]" : "[dim]completed[/]",
-                        $"[dim]{dt}[/]"
-                    );
-                }
-                AnsiConsole.Write(table);
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .BorderColor(Color.Grey)
+                .AddColumn(new TableColumn("[dim]#[/]").Centered())
+                .AddColumn("[dim]ID[/]")
+                .AddColumn("[dim]Title[/]")
+                .AddColumn(new TableColumn("[dim]Status[/]").Centered())
+                .AddColumn("[dim]Last active[/]");
+
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                var s  = sessions[i];
+                var dt = DateTimeOffset.FromUnixTimeSeconds(s.UpdatedAt)
+                             .LocalDateTime.ToString("MMM dd HH:mm");
+                var statusMarkup = s.Status == "active"
+                    ? "[green]● active[/]"
+                    : "[dim]○ done[/]";
+
+                table.AddRow(
+                    $"[#F0AA00]{i + 1}[/]",
+                    $"[dim]{s.Id[..8]}[/]",
+                    Markup.Escape(s.Title),
+                    statusMarkup,
+                    $"[dim]{dt}[/]"
+                );
+            }
+
+            AnsiConsole.Write(table);
+            AnsiConsole.WriteLine();
+
+            var pick = AnsiConsole.Prompt(
+                new TextPrompt<int>("  [#F0AA00]Pick a session #[/] [dim](0 to cancel)[/]:")
+                    .Validate(n => n >= 0 && n <= sessions.Count
+                        ? ValidationResult.Success()
+                        : ValidationResult.Error($"Enter 1–{sessions.Count} or 0 to cancel")));
+
+            if (pick == 0) break;
+
+            try
+            {
+                await agent.ResumeSessionAsync(sessions[pick - 1].Id);
+            }
+            catch (OperationCanceledException)
+            {
+                AnsiConsole.MarkupLine("  [dim]Session interrupted.[/]");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"  [red]Error:[/] {Markup.Escape(ex.Message)}");
             }
             AnsiConsole.WriteLine();
             break;
 
-        case "Exit":
+        case "✕  Exit":
             AnsiConsole.MarkupLine("  [dim]Goodbye.[/]");
             AnsiConsole.WriteLine();
             return;

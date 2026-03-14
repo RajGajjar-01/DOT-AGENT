@@ -4,6 +4,11 @@ using DotAgent.Models;
 
 namespace DotAgent.Services;
 
+public record TokenUsage(int PromptTokens, int CompletionTokens)
+{
+    public int Total => PromptTokens + CompletionTokens;
+}
+
 public class LlmService
 {
     private readonly ChatClient _client;
@@ -24,11 +29,11 @@ public class LlmService
         };
 
         var credential = new System.ClientModel.ApiKeyCredential(apiKey);
-var openAiClient = new OpenAIClient(credential, options);
+        var openAiClient = new OpenAIClient(credential, options);
         _client = openAiClient.GetChatClient(_model);
     }
 
-    public async Task<string> CompleteAsync(
+    public async Task<(string Response, TokenUsage Usage)> CompleteAsync(
         IEnumerable<Message> history,
         string systemPrompt,
         Action<string> onToken,
@@ -51,6 +56,7 @@ var openAiClient = new OpenAIClient(credential, options);
         }
 
         var fullResponse = new System.Text.StringBuilder();
+        TokenUsage usage = new(0, 0);
 
         await foreach (var update in _client
             .CompleteChatStreamingAsync(chatMessages, cancellationToken: ct))
@@ -63,8 +69,13 @@ var openAiClient = new OpenAIClient(credential, options);
                     onToken(part.Text);
                 }
             }
+
+            if (update.Usage is { } u)
+            {
+                usage = new TokenUsage(u.InputTokenCount, u.OutputTokenCount);
+            }
         }
 
-        return fullResponse.ToString();
+        return (fullResponse.ToString(), usage);
     }
 }
