@@ -10,7 +10,14 @@ public class Database
 
     public Database()
     {
-        var dbPath = Environment.GetEnvironmentVariable("DB_PATH") ?? "agent.db";
+        var workspace = Environment.GetEnvironmentVariable("WORKSPACE")
+            ?? Directory.GetCurrentDirectory();
+        var defaultDb = Path.Combine(workspace, "agent.db");
+        var dbPath = Environment.GetEnvironmentVariable("DB_PATH") ?? defaultDb;
+
+        // Ensure directory exists
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+
         _connectionString = $"Data Source={dbPath}";
         Initialize();
     }
@@ -30,6 +37,7 @@ public class Database
                 id         TEXT    PRIMARY KEY,
                 title      TEXT    NOT NULL DEFAULT 'New session',
                 status     TEXT    NOT NULL DEFAULT 'active',
+                plan       TEXT    NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -54,6 +62,10 @@ public class Database
             CREATE INDEX IF NOT EXISTS idx_executions_session
                 ON executions(session_id);
         """);
+
+        // Migration: add plan column if it doesn't exist
+        try { db.Execute("ALTER TABLE sessions ADD COLUMN plan TEXT NOT NULL DEFAULT ''"); }
+        catch { /* column already exists */ }
     }
 
     // ── Sessions ──────────────────────────────────────────────────
@@ -91,6 +103,21 @@ public class Database
         db.Execute(
             "UPDATE sessions SET status = @status, updated_at = @now WHERE id = @id",
             new { id, status, now = DateTimeOffset.UtcNow.ToUnixTimeSeconds() });
+    }
+
+    public void SavePlan(string id, string plan)
+    {
+        using var db = Open();
+        db.Execute(
+            "UPDATE sessions SET plan = @plan, updated_at = @now WHERE id = @id",
+            new { id, plan, now = DateTimeOffset.UtcNow.ToUnixTimeSeconds() });
+    }
+
+    public string GetPlan(string id)
+    {
+        using var db = Open();
+        return db.QueryFirstOrDefault<string>(
+            "SELECT plan FROM sessions WHERE id = @id", new { id }) ?? "";
     }
 
     // ── Messages ──────────────────────────────────────────────────

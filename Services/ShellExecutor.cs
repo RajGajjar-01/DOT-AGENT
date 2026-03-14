@@ -5,10 +5,24 @@ namespace DotAgent.Services;
 public class ShellExecutor
 {
     private readonly int _timeoutMs;
+    private string _workingDirectory;
 
-    public ShellExecutor(int timeoutSeconds = 30)
+    public string WorkingDirectory => _workingDirectory;
+
+    public ShellExecutor(int timeoutSeconds = 120)
     {
         _timeoutMs = timeoutSeconds * 1000;
+        _workingDirectory = Environment.GetEnvironmentVariable("WORKSPACE")
+            ?? Directory.GetCurrentDirectory();
+
+        // Ensure workspace exists
+        Directory.CreateDirectory(_workingDirectory);
+    }
+
+    public void SetWorkingDirectory(string path)
+    {
+        if (Directory.Exists(path))
+            _workingDirectory = Path.GetFullPath(path);
     }
 
     public record ExecutionResult(
@@ -21,15 +35,25 @@ public class ShellExecutor
     {
         var sw = Stopwatch.StartNew();
 
+        // Write the command to a temp script file to avoid escaping issues
+        var scriptPath = Path.GetTempFileName();
+        await File.WriteAllTextAsync(scriptPath, command);
+
         var psi = new ProcessStartInfo
         {
             FileName               = "/bin/bash",
-            Arguments              = $"-c \"{EscapeForShell(command)}\"",
+            Arguments              = scriptPath,
+            WorkingDirectory       = _workingDirectory,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             UseShellExecute        = false,
             CreateNoWindow         = true,
         };
+
+        // Pass through common env vars
+        psi.Environment["HOME"] = Environment.GetEnvironmentVariable("HOME") ?? "/root";
+        psi.Environment["PATH"] = Environment.GetEnvironmentVariable("PATH") ?? "/usr/local/bin:/usr/bin:/bin";
+        psi.Environment["LANG"] = "en_US.UTF-8";
 
         using var process = new Process { StartInfo = psi };
 
@@ -56,6 +80,7 @@ public class ShellExecutor
         {
             process.Kill(entireProcessTree: true);
             sw.Stop();
+            TryDeleteScript(scriptPath);
             return new ExecutionResult(
                 Output: "Error: command timed out.",
                 ExitCode: -1,
@@ -64,6 +89,8 @@ public class ShellExecutor
         }
 
         sw.Stop();
+        TryDeleteScript(scriptPath);
+
         return new ExecutionResult(
             Output: output.ToString().TrimEnd(),
             ExitCode: process.ExitCode,
@@ -71,6 +98,8 @@ public class ShellExecutor
             TimedOut: false);
     }
 
-    private static string EscapeForShell(string command) =>
-        command.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    private static void TryDeleteScript(string path)
+    {
+        try { File.Delete(path); } catch { /* ignore */ }
+    }
 }

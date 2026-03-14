@@ -5,6 +5,7 @@ public class Session
     public string Id { get; set; } = Guid.NewGuid().ToString();
     public string Title { get; set; } = "New session";
     public string Status { get; set; } = "active";
+    public string Plan { get; set; } = "";
     public long CreatedAt { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
     public long UpdatedAt { get; set; } = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 }

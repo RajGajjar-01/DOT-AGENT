@@ -1,0 +1,20 @@
+services:
+  dotagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dotagent:latest
+    container_name: dotagent
+
+    stdin_open: true
+    tty: true
+
+    volumes:
+      - ./workspace:/workspace
+
+    env_file:
+      - .env
+
+    environment:
+      - TERM=xterm-256color
+      - DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION=1

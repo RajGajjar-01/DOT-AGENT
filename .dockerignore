@@ -1,0 +1,12 @@
+bin/
+obj/
+data/
+workspace/
+.env
+*.db
+.git/
+.gitignore
+.vs/
+.vscode/
+*.user
+docker-compose.yml

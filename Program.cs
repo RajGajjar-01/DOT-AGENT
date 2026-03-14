@@ -44,7 +44,7 @@ for (int i = 0; i < lines.Length; i++)
 
 AnsiConsole.WriteLine();
 AnsiConsole.Write(new Markup(
-    "  [dim]AI Agent powered by [/][bold #F0AA00]GLM-4-Flash[/][dim] · Z.ai · SQLite[/]"));
+    $"  [dim]AI Agent powered by [/][bold #F0AA00]{Markup.Escape(llm.ModelName)}[/][dim] · {Markup.Escape(llm.ProviderName)} · SQLite[/]"));
 AnsiConsole.WriteLine();
 AnsiConsole.WriteLine();
 
@@ -53,9 +53,9 @@ while (true)
 {
     var choice = AnsiConsole.Prompt(
         new SelectionPrompt<string>()
-            .Title("  [bold #F0AA00]What do you want to do?[/]")
+            .Title($"  [bold #F0AA00]What do you want to do?[/]  [dim]({Markup.Escape(llm.ModelName)})[/]")
             .HighlightStyle(Style.Parse("bold #F0AA00"))
-            .AddChoices("⊕  New Chat", "↻  Load Session", "✕  Exit")
+            .AddChoices("⊕  New Chat", "↻  Load Session", "⇄  Switch Model", "✕  Exit")
     );
 
     AnsiConsole.WriteLine();
@@ -145,5 +145,30 @@ while (true)
             AnsiConsole.MarkupLine("  [dim]Goodbye.[/]");
             AnsiConsole.WriteLine();
             return;
+
+        case "⇄  Switch Model":
+            if (llm.Providers.Count <= 1)
+            {
+                AnsiConsole.MarkupLine("  [dim]Only one provider configured. Add more in your .env file.[/]");
+            }
+            else
+            {
+                var modelChoice = AnsiConsole.Prompt(
+                    new SelectionPrompt<string>()
+                        .Title($"  [bold #F0AA00]Pick a model[/]")
+                        .HighlightStyle(Style.Parse("bold #F0AA00"))
+                        .AddChoices(llm.Providers.Select(p =>
+                        {
+                            var active = p.Name == llm.ProviderName ? " ●" : "";
+                            return $"{p.Name} · {p.Model}{active}";
+                        }))
+                );
+
+                var selected = llm.Providers.First(p => modelChoice.StartsWith(p.Name));
+                llm.SwitchProvider(selected);
+                AnsiConsole.MarkupLine($"  [#F0AA00]Switched to[/] [bold]{Markup.Escape(selected.Model)}[/] [dim]({selected.Name})[/]");
+            }
+            AnsiConsole.WriteLine();
+            break;
     }
 }
