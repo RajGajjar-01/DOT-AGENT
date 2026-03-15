@@ -1,93 +1,130 @@
-using DotAgent.Models;
+using System.Net.Http.Json;
+using System.Text.Json;
+using OpenAI;
+using OpenAI.Chat;
 
 namespace DotAgent.Services;
 
 /// <summary>
 /// Pre-processes vague user prompts into detailed, actionable specifications
-/// using a fast LLM call before the main agent loop runs.
+/// using Tavily web search + dedicated Groq LLM call.
 ///
-/// Inspired by prompt enhancement patterns from v0.dev, Line0, and
-/// Princeton's mini-swe-agent philosophy of "trust the LLM more, scaffold less."
+/// Flow: User prompt → Tavily search for context → Groq refines with search results.
+/// Always uses Groq for fast, cheap prompt enhancement.
 /// </summary>
 public class PromptEnhancer
 {
-    private readonly LlmService _llm;
+    private readonly ChatClient? _groqClient;
+    private readonly HttpClient _httpClient;
+    private readonly string? _tavilyApiKey;
     private readonly string _workspaceRoot;
 
+    private const string GroqModel = "llama-3.3-70b-versatile";
+    private const string GroqEndpoint = "https://api.groq.com/openai/v1/";
+    private const string TavilyEndpoint = "https://api.tavily.com/search";
+
     private const string EnhancerSystemPrompt =
-        "You are a concise prompt enhancer. You refine vague coding requests into clear, actionable specifications. Be brief.";
+        "You are a concise prompt enhancer. You refine vague coding requests into clear, actionable specifications using the provided web search context. Be brief.";
 
     private const string EnhancerTemplate = """
         You are a prompt enhancer for an autonomous coding agent.
         Your job: transform vague user requests into detailed, actionable specifications.
 
-        Given the user's request and workspace context, produce an enhanced version that includes:
-        1. **Tech stack** — infer from workspace context or use sensible defaults
+        Given the user's request, workspace context, and web search results, produce an enhanced version that includes:
+        1. **Tech stack** — infer from search results + workspace context, use current best practices
         2. **Feature list** — explicit MVP features (only what was asked, nothing extra)
         3. **File structure** — proposed directory layout
-        4. **Success criteria** — how to verify it works
+        4. **Key dependencies** — specific package names and versions from search results
+        5. **Success criteria** — how to verify it works
 
         Rules:
         - If the request is ALREADY detailed (has specific tech, file paths, or code), return EXACTLY: PASS
-        - Keep enhancements concise — MAX 150 words
+        - Keep enhancements concise — MAX 200 words
         - Do NOT add features the user didn't ask for
-        - Prefer simple, proven tech stacks
+        - Prefer current, well-maintained libraries (use search results to verify)
         - Output ONLY the enhanced specification, nothing else
         - Do NOT include any preamble like "Here's the enhanced prompt:"
 
         WORKSPACE CONTEXT:
         {0}
 
-        USER'S REQUEST:
+        WEB SEARCH RESULTS:
         {1}
+
+        USER'S REQUEST:
+        {2}
         """;
 
-    public PromptEnhancer(LlmService llm)
+    public PromptEnhancer()
     {
-        _llm = llm;
         _workspaceRoot = Environment.GetEnvironmentVariable("WORKSPACE")
             ?? Directory.GetCurrentDirectory();
+
+        _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+
+        // Tavily API key
+        _tavilyApiKey = Environment.GetEnvironmentVariable("TAVILY_API_KEY");
+
+        // Build a dedicated Groq client for prompt enhancement
+        var groqKey = Environment.GetEnvironmentVariable("GROQ_API_KEY");
+        if (!string.IsNullOrWhiteSpace(groqKey))
+        {
+            var model = Environment.GetEnvironmentVariable("GROQ_MODEL") ?? GroqModel;
+            var options = new OpenAIClientOptions { Endpoint = new Uri(GroqEndpoint) };
+            var credential = new System.ClientModel.ApiKeyCredential(groqKey);
+            _groqClient = new OpenAIClient(credential, options).GetChatClient(model);
+        }
     }
 
     /// <summary>
     /// Enhance a vague user prompt into a detailed specification.
-    /// Returns the enhanced prompt and whether enhancement was applied.
+    /// Uses Tavily search for real-time context, then Groq for refinement.
     /// </summary>
     public async Task<(string Enhanced, bool WasEnhanced)> EnhanceAsync(
         string userInput, CancellationToken ct = default)
     {
-        // Skip enhancement for already-detailed prompts
+        if (_groqClient == null)
+            return (userInput, false);
+
         if (IsAlreadyDetailed(userInput))
             return (userInput, false);
 
-        // Skip for very short commands or meta-commands
         if (IsMetaCommand(userInput))
             return (userInput, false);
 
         var workspaceInfo = GetWorkspaceContext();
-        var prompt = string.Format(EnhancerTemplate, workspaceInfo, userInput);
+
+        // Search the web for current context about the user's request
+        var searchResults = await TavilySearchAsync(userInput, ct);
+
+        var prompt = string.Format(EnhancerTemplate, workspaceInfo, searchResults, userInput);
 
         try
         {
-            var messages = new List<Message>
+            var chatMessages = new List<ChatMessage>
             {
-                new() { Role = "user", Content = prompt }
+                ChatMessage.CreateSystemMessage(EnhancerSystemPrompt),
+                ChatMessage.CreateUserMessage(prompt)
             };
 
-            var (response, _, _) = await _llm.CompleteAsync(
-                messages,
-                EnhancerSystemPrompt,
-                onToken: _ => { },
-                ct: ct);
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
 
-            var trimmed = response.Trim();
+            var response = new System.Text.StringBuilder();
+            await foreach (var update in _groqClient.CompleteChatStreamingAsync(
+                chatMessages, cancellationToken: linkedCts.Token))
+            {
+                foreach (var part in update.ContentUpdate)
+                    if (!string.IsNullOrEmpty(part.Text))
+                        response.Append(part.Text);
+            }
 
-            // If LLM says PASS, the prompt was already good enough
+            var trimmed = response.ToString().Trim();
+
             if (trimmed.Equals("PASS", StringComparison.OrdinalIgnoreCase)
                 || trimmed.StartsWith("PASS", StringComparison.OrdinalIgnoreCase))
                 return (userInput, false);
 
-            // Sanity check: enhanced prompt should be non-empty and different
             if (string.IsNullOrWhiteSpace(trimmed) || trimmed == userInput)
                 return (userInput, false);
 
@@ -95,33 +132,93 @@ public class PromptEnhancer
         }
         catch
         {
-            // If enhancement fails for any reason, just use the original prompt
             return (userInput, false);
         }
     }
 
-    /// <summary>
-    /// Detect if a prompt is already detailed enough to skip enhancement.
-    /// </summary>
+    // ── Tavily Search ────────────────────────────────────────────
+
+    private async Task<string> TavilySearchAsync(string query, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_tavilyApiKey))
+            return "(No web search — TAVILY_API_KEY not set)";
+
+        try
+        {
+            var requestBody = new
+            {
+                api_key = _tavilyApiKey,
+                query = $"best practices current libraries for: {query}",
+                search_depth = "basic",
+                max_results = 3,
+                include_answer = true
+            };
+
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(8));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+            var response = await _httpClient.PostAsJsonAsync(TavilyEndpoint, requestBody, linkedCts.Token);
+
+            if (!response.IsSuccessStatusCode)
+                return "(Web search failed)";
+
+            var json = await response.Content.ReadAsStringAsync(linkedCts.Token);
+            return ParseTavilyResponse(json);
+        }
+        catch
+        {
+            return "(Web search timed out)";
+        }
+    }
+
+    private static string ParseTavilyResponse(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var sb = new System.Text.StringBuilder();
+
+            // Include the AI-generated answer if available
+            if (root.TryGetProperty("answer", out var answer) && answer.ValueKind == JsonValueKind.String)
+            {
+                var answerText = answer.GetString();
+                if (!string.IsNullOrWhiteSpace(answerText))
+                    sb.AppendLine($"Summary: {answerText}");
+            }
+
+            // Include top search results
+            if (root.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var result in results.EnumerateArray())
+                {
+                    var title = result.TryGetProperty("title", out var t) ? t.GetString() : "";
+                    var content = result.TryGetProperty("content", out var c) ? c.GetString() : "";
+
+                    if (!string.IsNullOrWhiteSpace(title))
+                        sb.AppendLine($"- {title}: {content?[..Math.Min(content.Length, 200)]}");
+                }
+            }
+
+            return sb.Length > 0 ? sb.ToString() : "(No relevant results)";
+        }
+        catch
+        {
+            return "(Could not parse search results)";
+        }
+    }
+
+    // ── Skip logic ───────────────────────────────────────────────
+
     private static bool IsAlreadyDetailed(string input)
     {
-        if (string.IsNullOrWhiteSpace(input))
-            return true; // nothing to enhance
+        if (string.IsNullOrWhiteSpace(input)) return true;
+        if (input.Length > 300) return true;
+        if (input.Contains("```")) return true;
 
-        // Long prompts are probably already detailed
-        if (input.Length > 300)
-            return true;
-
-        // Contains code blocks
-        if (input.Contains("```"))
-            return true;
-
-        // Has multiple lines with structure (bullet points, numbered lists)
         var lines = input.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length > 5)
-            return true;
+        if (lines.Length > 5) return true;
 
-        // Contains file paths
         if (input.Contains('/') && (input.Contains(".py") || input.Contains(".cs")
             || input.Contains(".js") || input.Contains(".ts")
             || input.Contains(".html") || input.Contains(".json")))
@@ -130,56 +227,42 @@ public class PromptEnhancer
         return false;
     }
 
-    /// <summary>
-    /// Skip enhancement for meta-commands and system interactions.
-    /// </summary>
     private static bool IsMetaCommand(string input)
     {
         var trimmed = input.Trim().ToLowerInvariant();
 
-        // Skip for agent control commands
-        if (trimmed.StartsWith("/") || trimmed.StartsWith("exit"))
-            return true;
+        if (trimmed.StartsWith("/") || trimmed.StartsWith("exit")) return true;
 
-        // Skip for yes/no/ok confirmations
         if (trimmed is "yes" or "no" or "ok" or "y" or "n" or "continue"
             or "approve" or "reject" or "skip")
             return true;
 
-        // Skip if it looks like an answer to a clarifying question (very short)
-        if (input.Length < 15 && !input.Contains(' '))
-            return true;
+        if (input.Length < 15 && !input.Contains(' ')) return true;
 
         return false;
     }
 
-    /// <summary>
-    /// Gather workspace context to help the enhancer make smarter decisions.
-    /// </summary>
+    // ── Workspace context ────────────────────────────────────────
+
     private string GetWorkspaceContext()
     {
-        var parts = new List<string>
-        {
-            $"Working directory: {_workspaceRoot}"
-        };
+        var parts = new List<string> { $"Working directory: {_workspaceRoot}" };
 
         try
         {
-            // Detect project type
             if (File.Exists(Path.Combine(_workspaceRoot, "package.json")))
-                parts.Add("Project type: Node.js (package.json detected)");
+                parts.Add("Project type: Node.js");
             if (File.Exists(Path.Combine(_workspaceRoot, "pyproject.toml")))
-                parts.Add("Project type: Python (pyproject.toml detected)");
+                parts.Add("Project type: Python");
             if (File.Exists(Path.Combine(_workspaceRoot, "requirements.txt")))
-                parts.Add("Project type: Python (requirements.txt detected)");
+                parts.Add("Project type: Python");
             if (Directory.GetFiles(_workspaceRoot, "*.csproj").Length > 0)
-                parts.Add("Project type: .NET C# (.csproj detected)");
+                parts.Add("Project type: .NET C#");
             if (File.Exists(Path.Combine(_workspaceRoot, "Cargo.toml")))
-                parts.Add("Project type: Rust (Cargo.toml detected)");
+                parts.Add("Project type: Rust");
             if (File.Exists(Path.Combine(_workspaceRoot, "go.mod")))
-                parts.Add("Project type: Go (go.mod detected)");
+                parts.Add("Project type: Go");
 
-            // List top-level items (limited)
             var topItems = Directory.GetFileSystemEntries(_workspaceRoot)
                 .Select(Path.GetFileName)
                 .Where(n => n != null && !n.StartsWith('.') && n != "node_modules"
@@ -189,14 +272,12 @@ public class PromptEnhancer
 
             if (topItems.Length > 0)
                 parts.Add($"Root contents: {string.Join(", ", topItems)}");
-
-            // Check if workspace is empty (new project scenario)
-            if (topItems.Length == 0)
-                parts.Add("Workspace is empty — this will be a new project");
+            else
+                parts.Add("Workspace is empty — new project");
         }
         catch
         {
-            parts.Add("(Could not read workspace contents)");
+            parts.Add("(Could not read workspace)");
         }
 
         return string.Join("\n", parts);

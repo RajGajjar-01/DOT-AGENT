@@ -12,30 +12,23 @@ public class AgentOrchestrator
     private readonly Database _db;
     private readonly LlmService _llm;
     private readonly ShellExecutor _shell;
-    private readonly FileTracker _fileTracker;
-    private readonly PlanStateTracker _planStateTracker;
     private readonly FileTools _fileTools;
     private readonly Context7Tools _context7Tools;
-    private readonly DocCache _docCache;  // Shared instance
+    private readonly DocCache _docCache;
     private readonly PromptEnhancer _promptEnhancer;
 
     private readonly string _workspaceRoot;
+    private readonly string _systemPrompt;
 
     private readonly List<Message> _history = [];
     private Session? _session;
-    private bool _awaitingClarification = false;
-
-    private readonly string _planPrompt;
-    private readonly string _executePromptTemplate;
-
-    private enum AgentMode { Plan, Execute }
 
     // ── Color palette (matches banner gradient) ───────────────────
-    private const string Gold     = "#F0AA00";
-    private const string GoldDim  = "white";
-    private const string GoldLit  = "#FFDC78";
+    private const string Gold    = "#F0AA00";
+    private const string GoldDim = "white";
+    private const string GoldLit = "#FFDC78";
 
-    // ── Read-only commands allowed in Plan mode ───────────────────
+    // ── Safety ────────────────────────────────────────────────────
     private static readonly string[] ReadOnlyPrefixes =
     [
         "ls", "find", "tree", "cat", "head", "tail", "wc", "file", "stat",
@@ -43,95 +36,23 @@ public class AgentOrchestrator
         "realpath", "basename", "dirname", "diff", "ctx7", "npx", "uv"
     ];
 
+    private const int MaxSteps = 25;
+    private const int DoomLoopThreshold = 3;
+
     public AgentOrchestrator(Database db, LlmService llm, ShellExecutor shell)
     {
         _db    = db;
         _llm   = llm;
         _shell = shell;
-        _fileTracker = new FileTracker(db);
-        _planStateTracker = new PlanStateTracker(db);
         _fileTools = new FileTools();
-        _docCache = new DocCache();  // Single shared instance
-        _context7Tools = new Context7Tools(_docCache);  // Reuse shared cache
-        _promptEnhancer = new PromptEnhancer(llm);
+        _docCache = new DocCache();
+        _context7Tools = new Context7Tools(_docCache, shell);
+        _promptEnhancer = new PromptEnhancer();
 
-        var root = Environment.GetEnvironmentVariable("WORKSPACE")
-            ?? Directory.GetCurrentDirectory();
-        _workspaceRoot = Path.GetFullPath(root);
+        _workspaceRoot = Path.GetFullPath(
+            Environment.GetEnvironmentVariable("WORKSPACE") ?? Directory.GetCurrentDirectory());
 
-        _planPrompt = LoadPrompt("PlanPrompt.txt");
-        _executePromptTemplate = LoadPrompt("ExecutePrompt.txt");
-    }
-
-    private bool IsWithinWorkspace(string fullPath)
-    {
-        fullPath = Path.GetFullPath(fullPath);
-        var root = _workspaceRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-            + Path.DirectorySeparatorChar;
-        return fullPath.StartsWith(root, StringComparison.Ordinal);
-    }
-
-    private bool IsCommandWorkspaceSafe(string command, out string reason)
-    {
-        reason = "";
-
-        if (string.IsNullOrWhiteSpace(command))
-        {
-            reason = "Empty command";
-            return false;
-        }
-
-        // Block explicit traversal patterns. This is a conservative sandbox.
-        if (command.Contains("../") || command.Contains("..\\"))
-        {
-            reason = "Command contains directory traversal '..' which is not allowed";
-            return false;
-        }
-
-        // Extract absolute paths like /etc/passwd or /root/...
-        // We allow /workspace/... only.
-        foreach (Match m in Regex.Matches(command, @"(?<![\w./-])/(?:[^\s'""`\\]|\\\s)+"))
-        {
-            var token = m.Value.TrimEnd(';', '&', '|', ')', ']', '}');
-            if (token == "/")
-            {
-                reason = "Access to filesystem root '/' is not allowed";
-                return false;
-            }
-
-            var full = Path.GetFullPath(token);
-            if (!IsWithinWorkspace(full))
-            {
-                reason = $"Command references path outside workspace: {token}";
-                return false;
-            }
-        }
-
-        // Block "cd /" or "cd /something" outside workspace.
-        var cdMatch = Regex.Match(command, @"\bcd\s+([^\s;&|]+)");
-        if (cdMatch.Success)
-        {
-            var target = cdMatch.Groups[1].Value.Trim('"', '\'', '`');
-            if (Path.IsPathRooted(target))
-            {
-                var full = Path.GetFullPath(target);
-                if (!IsWithinWorkspace(full))
-                {
-                    reason = $"cd target is outside workspace: {target}";
-                    return false;
-                }
-            }
-        }
-
-        return true;
-    }
-
-    private static string LoadPrompt(string filename)
-    {
-        var path = Path.Combine(AppContext.BaseDirectory, "Prompts", filename);
-        if (!File.Exists(path))
-            path = Path.Combine(Directory.GetCurrentDirectory(), "Prompts", filename);
-        return File.ReadAllText(path);
+        _systemPrompt = LoadPrompt("SystemPrompt.txt");
     }
 
     // ── Public entry points ───────────────────────────────────────
@@ -139,8 +60,7 @@ public class AgentOrchestrator
     public async Task RunNewSessionAsync(CancellationToken ct = default)
     {
         AnsiConsole.WriteLine();
-        var title = AnsiConsole.Ask<string>($"  [{Gold}]Session title[/] [dim](or press Enter)[/]: ")
-            .Trim();
+        var title = AnsiConsole.Ask<string>($"  [{Gold}]Session title[/] [dim](or press Enter)[/]: ").Trim();
         if (string.IsNullOrWhiteSpace(title))
             title = $"Session {DateTime.Now:MMM dd HH:mm}";
 
@@ -165,29 +85,14 @@ public class AgentOrchestrator
 
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine($"  [dim]Resuming:[/] [{Gold}]{_session.Id[..8]}[/] · {_session.Title}");
-        AnsiConsole.MarkupLine($"  [dim]{_history.Count} messages loaded from database[/]");
-
-        var plan = _db.GetPlan(sessionId);
-        if (!string.IsNullOrWhiteSpace(plan))
-        {
-            AnsiConsole.MarkupLine($"  [{Gold}]●[/] [dim]Plan loaded[/]");
-
-            // Reconcile planned steps with filesystem on resume
-            _planStateTracker.ReconcileWithFilesystem(sessionId);
-
-            var steps = _db.GetPlannedSteps(sessionId).ToList();
-            var pending = steps.Count(s => s.Status == "pending");
-            var done = steps.Count(s => s.Status == "done");
-            AnsiConsole.MarkupLine($"  [{Gold}]●[/] [dim]{done} done, {pending} pending files[/]");
-        }
-
+        AnsiConsole.MarkupLine($"  [dim]{_history.Count} messages loaded[/]");
         AnsiConsole.Write(new Rule().RuleStyle($"{GoldDim} dim"));
         AnsiConsole.WriteLine();
 
         await ChatLoopAsync(ct);
     }
 
-    // ── Chat loop (outer) ─────────────────────────────────────────
+    // ── Chat loop ─────────────────────────────────────────────────
 
     private async Task ChatLoopAsync(CancellationToken ct)
     {
@@ -196,8 +101,7 @@ public class AgentOrchestrator
             AnsiConsole.Markup($"  [bold {Gold}]You ›[/] ");
             var userInput = (Console.ReadLine() ?? string.Empty).Trim();
 
-            if (string.IsNullOrWhiteSpace(userInput))
-                continue;
+            if (string.IsNullOrWhiteSpace(userInput)) continue;
 
             if (userInput.Equals("exit", StringComparison.OrdinalIgnoreCase) ||
                 userInput.Equals("/exit", StringComparison.OrdinalIgnoreCase))
@@ -209,119 +113,39 @@ public class AgentOrchestrator
                 return;
             }
 
-            // /plan command — enter plan mode for a task
-            if (userInput.StartsWith("/plan", StringComparison.OrdinalIgnoreCase))
-            {
-                var task = userInput.Length > 5 ? userInput[5..].Trim() : "";
-
-                // /plan continue — re-enter plan mode with existing history
-                if (task.Equals("continue", StringComparison.OrdinalIgnoreCase) && _awaitingClarification)
-                {
-                    _awaitingClarification = false;
-                    AnsiConsole.MarkupLine($"  [{Gold}]◐[/] [dim]Continuing plan with your answers...[/]");
-                    await AgentLoopAsync(AgentMode.Plan, ct);
-                    continue;
-                }
-
-                if (string.IsNullOrWhiteSpace(task))
-                {
-                    AnsiConsole.Markup($"  [{Gold}]What should I plan?[/] ");
-                    task = (Console.ReadLine() ?? string.Empty).Trim();
-                    if (string.IsNullOrWhiteSpace(task)) continue;
-                }
-
-                var userMsg = new Message
-                {
-                    SessionId = _session!.Id,
-                    Role      = "user",
-                    Content   = task
-                };
-                _history.Add(userMsg);
-                _db.SaveMessage(userMsg);
-
-                _awaitingClarification = false;
-                AnsiConsole.MarkupLine($"  [{Gold}]◐[/] [dim]Entering plan mode...[/]");
-                await AgentLoopAsync(AgentMode.Plan, ct);
-                continue;
-            }
-
-            // If awaiting clarification, treat user input as answers and re-enter plan mode
-            if (_awaitingClarification)
-            {
-                var answerMsg = new Message
-                {
-                    SessionId = _session!.Id,
-                    Role      = "user",
-                    Content   = userInput
-                };
-                _history.Add(answerMsg);
-                _db.SaveMessage(answerMsg);
-
-                _awaitingClarification = false;
-                AnsiConsole.MarkupLine($"  [{Gold}]◐[/] [dim]Continuing plan with your answers...[/]");
-                await AgentLoopAsync(AgentMode.Plan, ct);
-                continue;
-            }
-
-            // ── Prompt Enhancement ──────────────────────────────────
+            // ── Prompt Enhancement (first message only) ──────────────
             var enhancedInput = userInput;
-            try
+            var isFirstMessage = !_history.Any(m => m.Role == "user");
+
+            if (isFirstMessage)
             {
-                var (enhanced, wasEnhanced) = await AnsiConsole.Status()
-                    .Spinner(Spinner.Known.Dots2)
-                    .SpinnerStyle(Style.Parse(Gold))
-                    .StartAsync($"[{GoldDim}]enhancing prompt...[/]", async _ =>
+                try
+                {
+                    var (enhanced, wasEnhanced) = await AnsiConsole.Status()
+                        .Spinner(Spinner.Known.Dots2)
+                        .SpinnerStyle(Style.Parse(Gold))
+                        .StartAsync($"[{GoldDim}]enhancing prompt...[/]", async _ =>
+                            await _promptEnhancer.EnhanceAsync(userInput, ct));
+
+                    if (wasEnhanced)
                     {
-                        return await _promptEnhancer.EnhanceAsync(userInput, ct);
-                    });
+                        AnsiConsole.MarkupLine($"  [{Gold}]✦ Enhanced prompt:[/]");
+                        AnsiConsole.WriteLine();
+                        AnsiConsole.Write(
+                            new Panel(new Markup($"[{GoldLit}]{Markup.Escape(enhanced)}[/]"))
+                                .Header($"[{Gold} bold] enhanced [/]")
+                                .Border(BoxBorder.Rounded)
+                                .BorderColor(new Color(240, 170, 0))
+                                .Padding(1, 0));
+                        AnsiConsole.WriteLine();
 
-                if (wasEnhanced)
-                {
-                    AnsiConsole.MarkupLine($"  [{Gold}]✦ Enhanced prompt:[/]");
-                    AnsiConsole.WriteLine();
-
-                    // Show enhanced prompt in a panel
-                    AnsiConsole.Write(
-                        new Panel(new Markup($"[{GoldLit}]{Markup.Escape(enhanced)}[/]"))
-                            .Header($"[{Gold} bold] enhanced [/]")
-                            .Border(BoxBorder.Rounded)
-                            .BorderColor(new Color(240, 170, 0))
-                            .Padding(1, 0));
-                    AnsiConsole.WriteLine();
-
-                    var useEnhanced = AnsiConsole.Confirm(
-                        $"  [{Gold}]Use enhanced prompt?[/]", defaultValue: true);
-
-                    if (useEnhanced)
-                        enhancedInput = enhanced;
+                        if (AnsiConsole.Confirm($"  [{Gold}]Use enhanced prompt?[/]", defaultValue: true))
+                            enhancedInput = enhanced;
+                    }
                 }
-            }
-            catch
-            {
-                // Enhancement failed silently — use original
+                catch { /* Enhancement failed — use original */ }
             }
 
-            // Check if we have an approved plan before allowing execute mode
-            var existingPlan = _db.GetPlan(_session!.Id);
-            if (string.IsNullOrWhiteSpace(existingPlan))
-            {
-                // No plan exists - MUST enter plan mode first
-                AnsiConsole.MarkupLine($"  [{Gold}]◐[/] [dim]No plan found. Entering plan mode first...[/]");
-                
-                var planMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "user",
-                    Content   = enhancedInput
-                };
-                _history.Add(planMsg);
-                _db.SaveMessage(planMsg);
-
-                await AgentLoopAsync(AgentMode.Plan, ct);
-                continue;
-            }
-
-            // Plan exists - proceed to execute mode
             var msg = new Message
             {
                 SessionId = _session!.Id,
@@ -331,133 +155,34 @@ public class AgentOrchestrator
             _history.Add(msg);
             _db.SaveMessage(msg);
 
-            await AgentLoopAsync(AgentMode.Execute, ct);
+            await AgentLoopAsync(ct);
         }
     }
 
-    private string GetSystemPrompt(AgentMode mode)
+    // ── Build system prompt with context ──────────────────────────
+
+    private string BuildSystemPrompt()
     {
-        string basePrompt;
-
-        if (mode == AgentMode.Plan)
-            basePrompt = _planPrompt;
-        else
-        {
-            var plan = _db.GetPlan(_session!.Id);
-            if (!string.IsNullOrWhiteSpace(plan))
-            {
-                // Truncate plan to only pending steps for faster context
-                var truncatedPlan = TruncatePlanToPending(plan);
-                basePrompt = _executePromptTemplate.Replace("{PLAN}", truncatedPlan);
-            }
-            else
-            {
-                basePrompt = LoadPrompt("SystemPrompt.txt");
-            }
-        }
-
-        // Build context sections in cache-friendly order:
-        // 1. Static environment info (no timestamps)
-        // 2. Planned files manifest
-        // 3. File manifest
-        // 4. Dynamic timestamp (at the very end to not break cache)
-
-        var staticEnv = $"""
-
-═══════════════════════════════════════════════════
-ENVIRONMENT
-═══════════════════════════════════════════════════
-
-- Working directory: {_shell.WorkingDirectory}
-- OS: {Environment.OSVersion}
-- Shell: /bin/bash
-""";
-
-        // Inject planned files manifest (what the agent plans to create)
-        var plannedManifest = _planStateTracker.BuildPlannedManifest(_session!.Id);
-        var plannedContext = "";
-        if (!string.IsNullOrWhiteSpace(plannedManifest))
-        {
-            plannedContext = $"""
-
-═══════════════════════════════════════════════════
-PLANNED FILES STATUS
-═══════════════════════════════════════════════════
-
-{plannedManifest}
-
-IMPORTANT: Check the "Pending Files" section above.
-- Do NOT recreate files marked as "done".
-- Start from the first "pending" file.
-- After creating a file, it will be marked as done automatically.
-""";
-        }
-
-        // Inject file manifest (what the agent has created/modified so far)
-        var manifest = _fileTracker.BuildFileManifest(_session!.Id);
-        var fileContext = "";
-        if (!string.IsNullOrWhiteSpace(manifest))
-        {
-            fileContext = $"""
-
-═══════════════════════════════════════════════════
-FILES CREATED/MODIFIED IN THIS SESSION
-═══════════════════════════════════════════════════
-
-{manifest}
-Use this to understand what has already been done.
-Continue from where you left off. Do NOT recreate existing files.
-""";
-        }
-
-        // Inject user's original task so the agent never forgets what was asked
         var userTask = _history.FirstOrDefault(m => m.Role == "user")?.Content;
-        var taskContext = "";
-        if (!string.IsNullOrWhiteSpace(userTask))
-        {
-            // Also collect clarification answers (subsequent user messages before the plan)
-            var clarificationAnswers = _history
-                .Where(m => m.Role == "user")
-                .Skip(1)  // skip the first (original task)
-                .Take(3)  // at most 3 follow-up answers
-                .Select(m => m.Content)
-                .ToList();
+        var taskCtx = !string.IsNullOrWhiteSpace(userTask)
+            ? $"\n\n═══ USER'S ORIGINAL TASK ═══\n{userTask}\n"
+            : "";
 
-            var answersSection = clarificationAnswers.Count > 0
-                ? "\n\nUser's follow-up answers:\n" + string.Join("\n---\n", clarificationAnswers)
-                : "";
+        var envCtx = $"""
 
-            taskContext = $"""
-
-═══════════════════════════════════════════════════
-USER'S ORIGINAL TASK
-═══════════════════════════════════════════════════
-
-{userTask}{answersSection}
-
-IMPORTANT: This is what the user originally asked for.
-Do NOT re-ask clarifying questions that have already been answered.
-If you already have enough information, proceed to exploration or planning.
-""";
-        }
-
-        // Dynamic timestamp at the very end (won't break cache for the prefix)
-        var timestamp = $"""
-
+═══ ENVIRONMENT ═══
+Working directory: {_shell.WorkingDirectory}
+OS: {Environment.OSVersion}
+Shell: /bin/bash
 Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
 """;
 
-        return basePrompt + staticEnv + taskContext + plannedContext + fileContext + timestamp;
+        return _systemPrompt + taskCtx + envCtx;
     }
 
+    // ── Agent loop (think → act → observe) ───────────────────────
 
-
-    // ── Agent loop (inner: think → act → observe) ─────────────────
-
-    private const int MaxSteps = 20;
-    private const int DoomLoopThreshold = 3;
-
-    private async Task AgentLoopAsync(AgentMode mode, CancellationToken ct)
+    private async Task AgentLoopAsync(CancellationToken ct)
     {
         int step = 0;
         var recentCommands = new List<string>();
@@ -465,131 +190,52 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
         while (!ct.IsCancellationRequested)
         {
             step++;
-
-            // Max steps guard
             if (step > MaxSteps)
             {
-                AnsiConsole.MarkupLine($"  [{Gold}]⚠[/] [dim]Reached {MaxSteps} steps. Returning control to you.[/]");
+                AnsiConsole.MarkupLine($"  [{Gold}]⚠[/] [dim]Reached {MaxSteps} steps. Returning control.[/]");
                 AnsiConsole.WriteLine();
                 break;
             }
 
             AnsiConsole.WriteLine();
 
+            // ── Think: call LLM ────────────────────────────────
             string llmResponse;
-            TokenUsage usage = new TokenUsage(0, 0);
+            TokenUsage usage = new(0, 0);
             LlmMetrics? metrics = null;
-            var systemPrompt = GetSystemPrompt(mode);
 
             try
             {
-                var contextWindow = _history.Count > 20
-                    ? _history[^20..]
-                    : _history;
+                var contextWindow = _history.Count > 20 ? _history[^20..] : _history;
 
                 (llmResponse, usage, metrics) = await AnsiConsole.Status()
                     .Spinner(Spinner.Known.Dots2)
                     .SpinnerStyle(Style.Parse(Gold))
-                    .StartAsync($"[{GoldDim}]{(mode == AgentMode.Plan ? "planning" : "executing")}...[/]", async _ =>
-                    {
-                        return await _llm.CompleteAsync(
-                            contextWindow,
-                            systemPrompt,
-                            onToken: _ => { },
-                            ct: ct);
-                    });
+                    .StartAsync($"[{GoldDim}]thinking...[/]", async _ =>
+                        await _llm.CompleteAsync(contextWindow, BuildSystemPrompt(), _ => { }, ct));
             }
             catch (OperationCanceledException)
             {
-                AnsiConsole.MarkupLine(
-                    $"  [red bold]✗ Timeout:[/] [red]LLM response took too long. Try a faster model.[/]");
+                AnsiConsole.MarkupLine($"  [red bold]✗ Timeout:[/] [red]LLM took too long.[/]");
                 break;
             }
             catch (Exception ex)
             {
-                AnsiConsole.MarkupLine(
-                    $"  [red bold]✗ LLM error:[/] [red]{Markup.Escape(ex.Message)}[/]");
+                AnsiConsole.MarkupLine($"  [red bold]✗ LLM error:[/] [red]{Markup.Escape(ex.Message)}[/]");
                 break;
             }
 
-            // ── Render the response cleanly ───────────────────────
-            var command  = ActionParser.Extract(llmResponse);
+            // ── Render response ──────────────────────────────────
             var textPart = ExtractTextPart(llmResponse);
-
-            // Show agent response
             if (!string.IsNullOrWhiteSpace(textPart))
             {
-                var modeLabel = mode == AgentMode.Plan ? "Planner" : "Agent";
-                AnsiConsole.Write(new Rule($"[bold {Gold}] {modeLabel} [/]")
-                    .RuleStyle($"{GoldDim} dim")
-                    .LeftJustified());
+                AnsiConsole.Write(new Rule($"[bold {Gold}] Agent [/]")
+                    .RuleStyle($"{GoldDim} dim").LeftJustified());
                 PrintTokenUsage(usage, metrics);
                 AnsiConsole.WriteLine();
-
                 RenderMarkdownToConsole(textPart.Trim());
-
                 AnsiConsole.Write(new Rule().RuleStyle($"{GoldDim} dim"));
                 AnsiConsole.WriteLine();
-
-                // In plan mode, check if the response contains a plan
-                if (mode == AgentMode.Plan && textPart.Contains("## Plan"))
-                {
-                    var planText = ExtractPlan(textPart);
-                    if (!string.IsNullOrWhiteSpace(planText))
-                    {
-                        _db.SavePlan(_session!.Id, planText);
-
-                        // Parse plan into structured steps for state tracking
-                        _planStateTracker.ParseAndSavePlan(_session.Id, planText);
-
-                        AnsiConsole.MarkupLine($"  [{Gold}]✓ Plan saved![/]");
-
-                        // Show planned files summary
-                        var pendingCount = _db.GetPlannedSteps(_session.Id).Count(s => s.Status == "pending");
-                        if (pendingCount > 0)
-                            AnsiConsole.MarkupLine($"  [{Gold}]●[/] [dim]{pendingCount} files planned[/]");
-
-                        AnsiConsole.WriteLine();
-
-                        var approve = AnsiConsole.Confirm($"  [{Gold}]Approve plan and start executing?[/]", defaultValue: true);
-                        if (approve)
-                        {
-                            AnsiConsole.MarkupLine($"  [{Gold}]→ Switching to execute mode[/]");
-                            AnsiConsole.Write(new Rule().RuleStyle($"{GoldDim} dim"));
-                            AnsiConsole.WriteLine();
-
-                            // Persist assistant message first
-                            var planMsg = new Message
-                            {
-                                SessionId = _session.Id,
-                                Role      = "assistant",
-                                Content   = llmResponse
-                            };
-                            _history.Add(planMsg);
-                            _db.SaveMessage(planMsg);
-                            _db.TouchSession(_session.Id);
-
-                            // Inject a user message to kick off execution
-                            var kickoff = new Message
-                            {
-                                SessionId = _session.Id,
-                                Role      = "user",
-                                Content   = "Plan approved. Start executing step by step."
-                            };
-                            _history.Add(kickoff);
-                            _db.SaveMessage(kickoff);
-
-                            // Recurse into execute mode
-                            await AgentLoopAsync(AgentMode.Execute, ct);
-                            return;
-                        }
-                        else
-                        {
-                            AnsiConsole.MarkupLine("  [dim]Plan saved but not executing yet. You can refine it or answer the questions above.[/]");
-                            _db.SavePlan(_session.Id, ""); // Clear plan so we stay in plan mode
-                        }
-                    }
-                }
             }
             else
             {
@@ -607,179 +253,112 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
             _db.SaveMessage(assistantMsg);
             _db.TouchSession(_session.Id);
 
-            // ── Act: check for bash block or file tool ──────────────
+            // ── Act: detect action type ──────────────────────────
             var actionType = ActionParser.GetActionType(llmResponse);
-            
-            if (actionType == ActionParser.ActionType.None)
-            {
-                // In plan mode, if no command and no plan detected, the agent
-                // may be asking clarifying questions
-                if (mode == AgentMode.Plan && !string.IsNullOrWhiteSpace(textPart) && textPart.Contains('?'))
-                {
-                    _awaitingClarification = true;
-                    AnsiConsole.MarkupLine($"  [{Gold}]↑[/] [dim]Answer the questions above, then type your response.[/]");
-                    AnsiConsole.MarkupLine($"  [dim]  (or type [/][{Gold}]/plan continue[/][dim] to proceed)[/]");
-                    AnsiConsole.WriteLine();
-                }
-                break;
-            }
 
-            // ── Handle File Tool commands ───────────────────────────
+            if (actionType == ActionParser.ActionType.None)
+                break; // No action — return control to user
+
+            // ── File Tool ────────────────────────────────────────
             if (actionType == ActionParser.ActionType.FileTool)
             {
-                var (fileResult, _) = _fileTools.ParseAndExecute(llmResponse);
-                
-                // Show file tool panel
+                var (result, _) = _fileTools.ParseAndExecute(llmResponse);
+
                 AnsiConsole.Write(
-                    new Panel(new Markup($"[{GoldLit}]{fileResult.ToolName}[/]"))
+                    new Panel(new Markup($"[{GoldLit}]{result.ToolName}[/]"))
                         .Header($"[{Gold} bold] file tool [/]")
                         .Border(BoxBorder.Rounded)
                         .BorderColor(new Color(240, 170, 0))
                         .Padding(1, 0));
                 AnsiConsole.WriteLine();
 
-                // In plan mode, only allow read operations
-                if (mode == AgentMode.Plan && fileResult.ToolName is "write_file" or "delete_file" or "create_dir")
-                {
-                    AnsiConsole.MarkupLine($"  [red bold]✗ Blocked:[/] [dim]Write operations are not allowed in plan mode[/]");
-                    var blockMsg = new Message
-                    {
-                        SessionId = _session.Id,
-                        Role      = "tool_result",
-                        Content   = "ERROR: Write operations are blocked in plan mode. You can only use read_file and list_dir."
-                    };
-                    _history.Add(blockMsg);
-                    _db.SaveMessage(blockMsg);
-                    continue;
-                }
-
-                // Show result
-                var icon = fileResult.Success ? "✓" : "✗";
-                var color = fileResult.Success ? "green" : "red";
-                AnsiConsole.MarkupLine($"  [{color}]{icon}[/] [dim]{fileResult.Output.Split('\n')[0]}[/]");
-                
-                if (fileResult.Output.Contains('\n'))
-                {
-                    var lines = fileResult.Output.Split('\n')[1..];
-                    foreach (var line in lines)
-                        AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(line)}[/]");
-                }
+                var icon = result.Success ? "✓" : "✗";
+                var color = result.Success ? "green" : "red";
+                AnsiConsole.MarkupLine($"  [{color}]{icon}[/] [dim]{Markup.Escape(result.Output.Split('\n')[0])}[/]");
                 AnsiConsole.WriteLine();
 
-                // Track file changes
-                if (fileResult.Success && fileResult.FilePath != null)
-                {
-                    _fileTracker.TrackCommand(_session.Id, 
-                        $"{fileResult.ToolName}: {fileResult.FilePath}", 
-                        fileResult.Output, 
-                        fileResult.Success ? 0 : 1);
-                    
-                    if (mode == AgentMode.Execute)
-                        _planStateTracker.ReconcileWithFilesystem(_session.Id);
-                }
-
-                var fileToolMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "tool_result",
-                    Content   = fileResult.Output
-                };
-                _history.Add(fileToolMsg);
-                _db.SaveMessage(fileToolMsg);
+                _history.Add(new Message { SessionId = _session.Id, Role = "tool_result", Content = result.Output });
+                _db.SaveMessage(_history[^1]);
                 continue;
             }
 
-            // ── Handle Context7 Tool commands ───────────────────────
+            // ── Context7 Tool ────────────────────────────────────
             if (actionType == ActionParser.ActionType.Context7Tool)
             {
-                var (ctx7Result, _) = await _context7Tools.ParseAndExecuteAsync(llmResponse);
-                
-                // Show context7 tool panel
+                var (result, _) = await _context7Tools.ParseAndExecuteAsync(llmResponse);
+
                 AnsiConsole.Write(
-                    new Panel(new Markup($"[{GoldLit}]{ctx7Result.ToolName}[/]"))
-                        .Header($"[{Gold} bold] context7 tool [/]")
+                    new Panel(new Markup($"[{GoldLit}]{result.ToolName}[/]"))
+                        .Header($"[{Gold} bold] context7 [/]")
                         .Border(BoxBorder.Rounded)
                         .BorderColor(new Color(240, 170, 0))
                         .Padding(1, 0));
                 AnsiConsole.WriteLine();
 
-                // Show result
-                var icon = ctx7Result.Success ? "✓" : "✗";
-                var color = ctx7Result.Success ? "green" : "red";
-                AnsiConsole.MarkupLine($"  [{color}]{icon}[/] [dim]{ctx7Result.Output.Split('\n')[0]}[/]");
-                
-                if (ctx7Result.Output.Contains('\n'))
-                {
-                    var lines = ctx7Result.Output.Split('\n')[1..];
-                    foreach (var line in lines)
-                        AnsiConsole.MarkupLine($"  [dim]{Markup.Escape(line)}[/]");
-                }
+                var icon = result.Success ? "✓" : "✗";
+                var color = result.Success ? "green" : "red";
+                AnsiConsole.MarkupLine($"  [{color}]{icon}[/] [dim]{Markup.Escape(result.Output.Split('\n')[0])}[/]");
                 AnsiConsole.WriteLine();
 
-                var ctx7ToolMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "tool_result",
-                    Content   = ctx7Result.Output
-                };
-                _history.Add(ctx7ToolMsg);
-                _db.SaveMessage(ctx7ToolMsg);
+                _history.Add(new Message { SessionId = _session.Id, Role = "tool_result", Content = result.Output });
+                _db.SaveMessage(_history[^1]);
                 continue;
             }
 
-            // ── Handle Bash commands ─────────────────────────────────
-            if (ActionParser.IsExit(command!))
+            // ── Bash Command ─────────────────────────────────────
+            var command = ActionParser.Extract(llmResponse)!;
+
+            if (ActionParser.IsExit(command))
             {
-                if (mode == AgentMode.Plan)
+                // ── Plan detection: if agent output a plan + exit, ask for approval
+                if (!string.IsNullOrWhiteSpace(textPart) && textPart.Contains("## Plan"))
                 {
-                    // Plan mode exit — check if agent was asking questions
-                    if (!string.IsNullOrWhiteSpace(textPart) && textPart.Contains('?') && !textPart.Contains("## Plan"))
+                    AnsiConsole.MarkupLine($"  [{Gold}]✓ Plan ready![/]");
+                    AnsiConsole.WriteLine();
+
+                    var approve = AnsiConsole.Confirm($"  [{Gold}]Approve plan and start executing?[/]", defaultValue: true);
+                    if (approve)
                     {
-                        _awaitingClarification = true;
-                        AnsiConsole.MarkupLine($"  [{Gold}]↑[/] [dim]Answer the questions above, then type your response.[/]");
-                        AnsiConsole.MarkupLine($"  [dim]  (or type [/][{Gold}]/plan continue[/][dim] to proceed)[/]");
+                        AnsiConsole.MarkupLine($"  [{Gold}]→ Executing plan...[/]");
+                        AnsiConsole.Write(new Rule().RuleStyle($"{GoldDim} dim"));
                         AnsiConsole.WriteLine();
+
+                        var kickoff = new Message
+                        {
+                            SessionId = _session.Id,
+                            Role      = "user",
+                            Content   = "Plan approved. Start executing step by step."
+                        };
+                        _history.Add(kickoff);
+                        _db.SaveMessage(kickoff);
+                        continue; // Continue the agent loop into execution
                     }
-                    break;
+                    else
+                    {
+                        AnsiConsole.MarkupLine("  [dim]Plan not approved. You can refine your request.[/]");
+                        AnsiConsole.WriteLine();
+                        break; // Return to chat loop
+                    }
                 }
+
                 _db.UpdateSessionStatus(_session.Id, "completed");
                 AnsiConsole.MarkupLine("  [dim]Agent exited session.[/]");
                 AnsiConsole.WriteLine();
                 return;
             }
 
-            // ── Plan mode: block write commands ───────────────────
-            if (mode == AgentMode.Plan && !IsReadOnlyCommand(command))
-            {
-                AnsiConsole.MarkupLine($"  [red bold]✗ Blocked:[/] [dim]Write commands are not allowed in plan mode[/]");
-                AnsiConsole.MarkupLine($"  [dim]Command: {Markup.Escape(command.Length > 80 ? command[..80] + "..." : command)}[/]");
-                AnsiConsole.WriteLine();
-
-                var blockMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "tool_result",
-                    Content   = "ERROR: Write commands are blocked in plan mode. You can only use read-only commands (ls, cat, grep, find, tree, ctx7, etc). Do NOT try to create, edit, or delete files."
-                };
-                _history.Add(blockMsg);
-                _db.SaveMessage(blockMsg);
-                continue;
-            }
-
-            // ── Doom loop detection ───────────────────────────────
+            // Doom loop detection
             var cmdTrimmed = command.Trim();
             recentCommands.Add(cmdTrimmed);
-            if (recentCommands.Count > DoomLoopThreshold)
-                recentCommands.RemoveAt(0);
-
+            if (recentCommands.Count > DoomLoopThreshold) recentCommands.RemoveAt(0);
             if (recentCommands.Count == DoomLoopThreshold && recentCommands.All(c => c == cmdTrimmed))
             {
-                AnsiConsole.MarkupLine($"  [{Gold}]⚠[/] [dim]Agent is repeating the exact same command {DoomLoopThreshold} times. Returning control to you.[/]");
+                AnsiConsole.MarkupLine($"  [{Gold}]⚠[/] [dim]Repeating same command {DoomLoopThreshold}x. Returning control.[/]");
                 AnsiConsole.WriteLine();
                 break;
             }
 
-            // ── Show command panel ────────────────────────────────
+            // Show command panel
             AnsiConsole.Write(
                 new Panel(new Markup($"[{GoldLit}]{Markup.Escape(command)}[/]"))
                     .Header($"[{Gold} bold] bash [/]")
@@ -788,24 +367,15 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
                     .Padding(1, 0));
             AnsiConsole.WriteLine();
 
+            // Sandbox check + auto-execute read-only
             bool confirmed;
-
-            // ── Sandbox: restrict bash commands to workspace only ──
-            // Read-only commands are safe even if they reference system paths
-            if (!IsReadOnlyCommand(command) && !IsCommandWorkspaceSafe(command, out var sandboxReason))
+            if (!IsReadOnlyCommand(command) && !IsCommandWorkspaceSafe(command, out var reason))
             {
-                AnsiConsole.MarkupLine($"  [red bold]✗ Blocked:[/] [dim]Command is outside workspace sandbox[/]");
-                AnsiConsole.MarkupLine($"  [dim]Reason: {Markup.Escape(sandboxReason)}[/]");
+                AnsiConsole.MarkupLine($"  [red bold]✗ Blocked:[/] [dim]{Markup.Escape(reason)}[/]");
                 AnsiConsole.WriteLine();
-
-                var blockMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "tool_result",
-                    Content   = $"ERROR: Command blocked by workspace sandbox. Reason: {sandboxReason}. Allowed root: {_workspaceRoot}"
-                };
-                _history.Add(blockMsg);
-                _db.SaveMessage(blockMsg);
+                _history.Add(new Message { SessionId = _session.Id, Role = "tool_result",
+                    Content = $"ERROR: Blocked by sandbox. {reason}" });
+                _db.SaveMessage(_history[^1]);
                 continue;
             }
 
@@ -821,188 +391,100 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
 
             if (!confirmed)
             {
-                var skipMsg = new Message
-                {
-                    SessionId = _session.Id,
-                    Role      = "tool_result",
-                    Content   = "User skipped execution of this command."
-                };
-                _history.Add(skipMsg);
-                _db.SaveMessage(skipMsg);
+                _history.Add(new Message { SessionId = _session.Id, Role = "tool_result",
+                    Content = "User skipped this command." });
+                _db.SaveMessage(_history[^1]);
                 break;
             }
 
-            // ── Observe: execute command ──────────────────────────
+            // ── Execute ──────────────────────────────────────────
             AnsiConsole.WriteLine();
-            ShellExecutor.ExecutionResult result = default!;
+            ShellExecutor.ExecutionResult result2 = default!;
             await AnsiConsole.Status()
                 .Spinner(Spinner.Known.Dots)
                 .SpinnerStyle(Style.Parse(Gold))
-                .StartAsync("[dim]executing...[/]", async _ =>
-                {
-                    result = await _shell.RunAsync(command);
-                });
+                .StartAsync("[dim]executing...[/]", async _ => { result2 = await _shell.RunAsync(command); });
 
             _db.SaveExecution(new Execution
             {
                 SessionId  = _session.Id,
                 Command    = command,
-                Output     = result.Output,
-                ExitCode   = result.ExitCode,
-                DurationMs = result.DurationMs
+                Output     = result2.Output,
+                ExitCode   = result2.ExitCode,
+                DurationMs = result2.DurationMs
             });
 
-            // Track file changes from this command
-            _fileTracker.TrackCommand(_session.Id, command, result.Output, result.ExitCode);
-
-            // Mark planned steps as done when files are created
-            if (result.ExitCode == 0 && mode == AgentMode.Execute)
-            {
-                _planStateTracker.ReconcileWithFilesystem(_session.Id);
-            }
-
             AnsiConsole.WriteLine();
-            var exitIcon  = result.ExitCode == 0 ? "✓" : "✗";
-            var exitColor = result.ExitCode == 0 ? "green" : "red";
-            var timedOut  = result.TimedOut ? " [red]· timed out[/]" : "";
-
-            AnsiConsole.MarkupLine(
-                $"  [{exitColor}]{exitIcon}[/] [dim]exit {result.ExitCode} · {result.DurationMs}ms{timedOut}[/]");
+            var exitIcon  = result2.ExitCode == 0 ? "✓" : "✗";
+            var exitColor = result2.ExitCode == 0 ? "green" : "red";
+            var timedOut  = result2.TimedOut ? " [red]· timed out[/]" : "";
+            AnsiConsole.MarkupLine($"  [{exitColor}]{exitIcon}[/] [dim]exit {result2.ExitCode} · {result2.DurationMs}ms{timedOut}[/]");
             AnsiConsole.WriteLine();
 
-            var toolContent = string.IsNullOrWhiteSpace(result.Output)
+            var toolContent = string.IsNullOrWhiteSpace(result2.Output)
                 ? "Command executed successfully. No output."
-                : TruncateToolOutput(result.Output, result.ExitCode);
+                : TruncateOutput(result2.Output, result2.ExitCode);
 
-            var toolMsg = new Message
-            {
-                SessionId = _session.Id,
-                Role      = "tool_result",
-                Content   = toolContent
-            };
-            _history.Add(toolMsg);
-            _db.SaveMessage(toolMsg);
+            _history.Add(new Message { SessionId = _session.Id, Role = "tool_result", Content = toolContent });
+            _db.SaveMessage(_history[^1]);
         }
     }
 
-    // ── Plan extraction ───────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────
 
-    private static string ExtractPlan(string text)
+    private static string LoadPrompt(string filename)
     {
-        var match = Regex.Match(text, @"##\s*Plan\b([\s\S]*)", RegexOptions.Multiline);
-        return match.Success ? match.Value.Trim() : "";
+        var path = Path.Combine(AppContext.BaseDirectory, "Prompts", filename);
+        if (!File.Exists(path))
+            path = Path.Combine(Directory.GetCurrentDirectory(), "Prompts", filename);
+        return File.ReadAllText(path);
     }
 
-    /// <summary>
-    /// Truncate plan to only show pending steps (based on planned_steps status).
-    /// This reduces context size for faster LLM responses.
-    /// </summary>
-    private string TruncatePlanToPending(string fullPlan)
+    private bool IsWithinWorkspace(string fullPath)
     {
-        var steps = _db.GetPlannedSteps(_session!.Id).ToList();
-        var pendingSteps = steps.Where(s => s.Status == "pending").ToList();
-        
-        if (pendingSteps.Count == 0)
-        {
-            // All done - just show goal and verification
-            var goalMatch = Regex.Match(fullPlan, @"\*\*Goal:\*\*\s*(.+?)(?=\n|$)");
-            var goal = goalMatch.Success ? goalMatch.Value : "";
-            return $"{goal}\n\n**All steps completed.** Run verification commands if any.";
-        }
-
-        // Build minimal plan with only pending steps
-        var sb = new StringBuilder();
-        
-        // Extract goal
-        var goalMatch2 = Regex.Match(fullPlan, @"\*\*Goal:\*\*\s*(.+?)(?=\n|$)");
-        if (goalMatch2.Success)
-            sb.AppendLine(goalMatch2.Value);
-        
-        // Extract tech stack
-        var techMatch = Regex.Match(fullPlan, @"\*\*Tech Stack:\*\*\s*(.+?)(?=\n|$)");
-        if (techMatch.Success)
-            sb.AppendLine(techMatch.Value);
-        
-        sb.AppendLine();
-        sb.AppendLine($"**Pending Steps:** {pendingSteps.Count} remaining");
-        sb.AppendLine();
-        
-        foreach (var step in pendingSteps.Take(3)) // Show max 3 pending steps
-        {
-            sb.AppendLine($"### Step {step.StepNumber}: {step.Description}");
-            sb.AppendLine($"- **File:** `{step.FilePath}`");
-            sb.AppendLine($"- **Action:** {step.Action}");
-            sb.AppendLine();
-        }
-        
-        if (pendingSteps.Count > 3)
-            sb.AppendLine($"... and {pendingSteps.Count - 3} more pending steps.");
-        
-        // Extract verification section
-        var verifyMatch = Regex.Match(fullPlan, @"### Verification[\s\S]*?(?=### Risks|$)");
-        if (verifyMatch.Success)
-        {
-            sb.AppendLine();
-            sb.AppendLine(verifyMatch.Value.Trim());
-        }
-
-        return sb.ToString();
+        fullPath = Path.GetFullPath(fullPath);
+        var root = _workspaceRoot.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return fullPath.StartsWith(root, StringComparison.Ordinal);
     }
 
-    // ── Tool output truncation ────────────────────────────────────
-
-    /// <summary>
-    /// Truncate tool output to reduce tokens while preserving key information.
-    /// For errors, keep the tail (where the actual error usually is).
-    /// For success, keep head + tail with a middle truncation indicator.
-    /// </summary>
-    private static string TruncateToolOutput(string output, int exitCode)
+    private bool IsCommandWorkspaceSafe(string command, out string reason)
     {
-        const int maxChars = 2000; // Reduced from 4000 for faster responses
-        const int tailChars = 800; // Keep this much from the end for errors
+        reason = "";
+        if (string.IsNullOrWhiteSpace(command)) { reason = "Empty command"; return false; }
+        if (command.Contains("../") || command.Contains("..\\")) { reason = "Directory traversal not allowed"; return false; }
 
-        if (output.Length <= maxChars)
-            return output;
-
-        // For errors, prioritize the tail (error messages are usually at the end)
-        if (exitCode != 0)
+        foreach (Match m in Regex.Matches(command, @"(?<![\w./-])/(?:[^\s'\""`\\]|\\\s)+"))
         {
-            var errorTail = output[^tailChars..];
-            return $"[Output truncated - showing last {tailChars} chars]\n...{errorTail}";
+            var token = m.Value.TrimEnd(';', '&', '|', ')', ']', '}');
+            if (token == "/") { reason = "Root '/' access not allowed"; return false; }
+            if (!IsWithinWorkspace(Path.GetFullPath(token))) { reason = $"Path outside workspace: {token}"; return false; }
         }
 
-        // For success, show head + tail
-        var head = output[..(maxChars / 2)];
-        var tail = output[^(maxChars / 2)..];
-        return $"{head}\n\n... [output truncated, {output.Length - maxChars} chars omitted] ...\n\n{tail}";
+        var cdMatch = Regex.Match(command, @"\bcd\s+([^\s;&|]+)");
+        if (cdMatch.Success)
+        {
+            var target = cdMatch.Groups[1].Value.Trim('"', '\'', '`');
+            if (Path.IsPathRooted(target) && !IsWithinWorkspace(Path.GetFullPath(target)))
+            { reason = $"cd target outside workspace: {target}"; return false; }
+        }
+        return true;
     }
-
-    // ── Read-only command check ───────────────────────────────────
 
     private static bool IsReadOnlyCommand(string command)
     {
-        // Handle chained commands (&&, ;, ||)
         var parts = Regex.Split(command, @"\s*(?:&&|;|\|\|)\s*");
         foreach (var part in parts)
         {
             var trimmed = part.Trim();
             if (string.IsNullOrWhiteSpace(trimmed)) continue;
+            var firstWord = Path.GetFileName(trimmed.Split([' ', '\t'], 2)[0]);
 
-            // Get the first word (the actual command)
-            var firstWord = trimmed.Split([' ', '\t'], 2)[0];
-
-            // Strip any path prefix (e.g., /usr/bin/cat → cat)
-            firstWord = Path.GetFileName(firstWord);
-
-            // Safety: only allow npx for ctx7 commands
             if (firstWord.Equals("npx", StringComparison.OrdinalIgnoreCase))
             {
                 var args = trimmed.Split([' ', '\t'], StringSplitOptions.RemoveEmptyEntries);
-                // Allow: npx ctx7 ..., npx -y @upstash/context7-mcp ...
-                var hasCtx7 = args.Any(a =>
-                    a.Contains("ctx7", StringComparison.OrdinalIgnoreCase) ||
-                    a.Contains("context7", StringComparison.OrdinalIgnoreCase));
-                if (!hasCtx7) return false;
+                if (!args.Any(a => a.Contains("ctx7", StringComparison.OrdinalIgnoreCase) ||
+                                   a.Contains("context7", StringComparison.OrdinalIgnoreCase)))
+                    return false;
                 continue;
             }
 
@@ -1012,15 +494,28 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
         return true;
     }
 
-    // ── Extract text outside bash fences ────────────────────────────
+    private static string TruncateOutput(string output, int exitCode)
+    {
+        const int max = 2000;
+        if (output.Length <= max) return output;
+        if (exitCode != 0) return $"[Truncated — last 800 chars]\n...{output[^800..]}";
+        return $"{output[..(max / 2)]}\n\n... [{output.Length - max} chars omitted] ...\n\n{output[^(max / 2)..]}";
+    }
 
     private static string ExtractTextPart(string response)
     {
-        var cleaned = Regex.Replace(response, @"```bash\s*\n[\s\S]*?```", "", RegexOptions.Multiline);
-        return cleaned.Trim();
+        // Strip bash code blocks
+        var text = Regex.Replace(response, @"```bash\s*\n[\s\S]*?```", "", RegexOptions.Multiline);
+        // Strip file tool XML blocks: <write_file ...>...</write_file>, <read_file>...</read_file>, etc.
+        text = Regex.Replace(text, @"<(write_file|read_file|list_dir|create_dir|delete_file)\b[^>]*>[\s\S]*?</\1>", "", RegexOptions.IgnoreCase);
+        // Strip context7 self-closing tags
+        text = Regex.Replace(text, @"<context7_\w+\b[^>]*/?>", "", RegexOptions.IgnoreCase);
+        // Collapse 3+ consecutive blank lines into 1
+        text = Regex.Replace(text, @"\n{3,}", "\n\n");
+        return text.Trim();
     }
 
-    // ── Markdown → Spectre markup ─────────────────────────────────
+    // ── Markdown rendering ───────────────────────────────────────
 
     private static void RenderMarkdownToConsole(string text)
     {
@@ -1036,18 +531,15 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
                 if (!inCodeBlock)
                 {
                     inCodeBlock = true;
-                    codeLang = rawLine.TrimStart().Length > 3
-                        ? rawLine.TrimStart()[3..].Trim()
-                        : "code";
+                    codeLang = rawLine.TrimStart().Length > 3 ? rawLine.TrimStart()[3..].Trim() : "code";
                     if (string.IsNullOrWhiteSpace(codeLang)) codeLang = "code";
                     codeContent.Clear();
                 }
                 else
                 {
                     inCodeBlock = false;
-                    var codeText = codeContent.ToString().TrimEnd();
                     AnsiConsole.Write(
-                        new Panel(new Markup($"[{GoldLit}]{Markup.Escape(codeText)}[/]"))
+                        new Panel(new Markup($"[{GoldLit}]{Markup.Escape(codeContent.ToString().TrimEnd())}[/]"))
                             .Header($"[{Gold} bold] {Markup.Escape(codeLang)} [/]")
                             .Border(BoxBorder.Rounded)
                             .BorderColor(new Color(100, 100, 100))
@@ -1057,59 +549,33 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
                 continue;
             }
 
-            if (inCodeBlock)
-            {
-                codeContent.AppendLine(rawLine);
-                continue;
-            }
+            if (inCodeBlock) { codeContent.AppendLine(rawLine); continue; }
 
             var line = Markup.Escape(rawLine);
-
-            if (Regex.IsMatch(line, @"^###\s+"))
-                line = Regex.Replace(line, @"^###\s+(.+)$", $"[bold {Gold}]$1[/]");
-            else if (Regex.IsMatch(line, @"^##\s+"))
-                line = Regex.Replace(line, @"^##\s+(.+)$", $"[bold {Gold} underline]$1[/]");
-            else if (Regex.IsMatch(line, @"^#\s+"))
-                line = Regex.Replace(line, @"^#\s+(.+)$", $"[bold {Gold} underline]$1[/]");
-            else if (Regex.IsMatch(line, @"^\s*[-*]\s+"))
-                line = Regex.Replace(line, @"^\s*[-*]\s+(.+)$", $"[{Gold}]•[/] $1");
-            else if (Regex.IsMatch(line, @"^\s*\d+\.\s+"))
-                line = Regex.Replace(line, @"^\s*(\d+)\.\s+(.+)$", $"[{Gold}]$1.[/] $2");
+            if (Regex.IsMatch(line, @"^###\s+"))      line = Regex.Replace(line, @"^###\s+(.+)$", $"[bold {Gold}]$1[/]");
+            else if (Regex.IsMatch(line, @"^##\s+"))   line = Regex.Replace(line, @"^##\s+(.+)$", $"[bold {Gold} underline]$1[/]");
+            else if (Regex.IsMatch(line, @"^#\s+"))    line = Regex.Replace(line, @"^#\s+(.+)$", $"[bold {Gold} underline]$1[/]");
+            else if (Regex.IsMatch(line, @"^\s*[-*]\s+")) line = Regex.Replace(line, @"^\s*[-*]\s+(.+)$", $"[{Gold}]•[/] $1");
+            else if (Regex.IsMatch(line, @"^\s*\d+\.\s+")) line = Regex.Replace(line, @"^\s*(\d+)\.\s+(.+)$", $"[{Gold}]$1.[/] $2");
 
             line = Regex.Replace(line, @"([├└│─┬┤┐┘┌╰╭╮╯]+)", "[dim]$1[/]");
-
             line = Regex.Replace(line, @"\*\*(.+?)\*\*", "[bold]$1[/]");
-            line = Regex.Replace(line, @"__(.+?)__",     "[bold]$1[/]");
+            line = Regex.Replace(line, @"__(.+?)__", "[bold]$1[/]");
             line = Regex.Replace(line, @"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", "[italic]$1[/]");
             line = Regex.Replace(line, @"`([^`]+)`", $"[{Gold}]$1[/]");
 
-            try
-            {
-                AnsiConsole.MarkupLine($"  {line}");
-            }
-            catch
-            {
-                AnsiConsole.WriteLine($"  {rawLine}");
-            }
+            try { AnsiConsole.MarkupLine($"  {line}"); }
+            catch { AnsiConsole.WriteLine($"  {rawLine}"); }
         }
-
         AnsiConsole.WriteLine();
     }
 
     private static void PrintTokenUsage(TokenUsage usage, LlmMetrics? metrics = null)
     {
         if (usage.Total == 0) return;
-
         var text = $"tokens: ↑ {usage.PromptTokens:N0}  ↓ {usage.CompletionTokens:N0}  Σ {usage.Total:N0}";
-        
-        if (metrics != null)
-        {
-            text += $"  │  TTFT: {metrics.TimeToFirstTokenMs:N0}ms  Total: {metrics.TotalDurationMs:N0}ms";
-        }
-        
-        var termWidth = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
-        var padding = Math.Max(0, termWidth - text.Length - 2);
-
-        AnsiConsole.MarkupLine($"{new string(' ', padding)}[dim]{Markup.Escape(text)}[/]");
+        if (metrics != null) text += $"  │  TTFT: {metrics.TimeToFirstTokenMs:N0}ms  Total: {metrics.TotalDurationMs:N0}ms";
+        var w = Console.WindowWidth > 0 ? Console.WindowWidth : 120;
+        AnsiConsole.MarkupLine($"{new string(' ', Math.Max(0, w - text.Length - 2))}[dim]{Markup.Escape(text)}[/]");
     }
 }

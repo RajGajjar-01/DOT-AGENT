@@ -15,7 +15,12 @@ public static class ActionParser
 
     // Context7 tool patterns (self-closing XML tags)
     private static readonly Regex Context7ToolPattern = new(
-        @"<context7_(resolve|query)\b[^>]*/>",
+        @"<context7_(resolve|query)\b[^>]*/?>",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // Context7 commands inside bash blocks (LLM sometimes omits angle brackets)
+    private static readonly Regex BashContext7Pattern = new(
+        @"context7_(resolve|query)\s+\w+\s*=",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public static string? Extract(string llmOutput)
@@ -41,10 +46,15 @@ public static class ActionParser
         FileToolPattern.IsMatch(llmOutput);
 
     /// <summary>
-    /// Check if the output contains a Context7 tool command.
+    /// Check if the output contains a Context7 tool command (XML tags or bare commands in bash).
     /// </summary>
-    public static bool HasContext7Tool(string llmOutput) =>
-        Context7ToolPattern.IsMatch(llmOutput);
+    public static bool HasContext7Tool(string llmOutput)
+    {
+        if (Context7ToolPattern.IsMatch(llmOutput)) return true;
+        // Also check inside bash blocks for bare context7 commands
+        var cmd = Extract(llmOutput);
+        return cmd != null && BashContext7Pattern.IsMatch(cmd);
+    }
 
     /// <summary>
     /// Determine the action type from LLM output.
