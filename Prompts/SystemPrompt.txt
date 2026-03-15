@@ -23,31 +23,58 @@ When asked to build something, follow this workflow:
 STEP 1 — PLAN FIRST
 - Before writing ANY code, briefly list the files you will create and what each does.
 - Keep the plan short (3-5 bullet points max).
+- ALWAYS create a dedicated project folder FIRST (e.g., `/workspace/myproject/`)
+- NEVER create venv, node_modules, or files directly in `/workspace/` root
 
-STEP 2 — CREATE FILES ONE BY ONE
-- Create each file using `cat << 'EOF' > filename` or `tee`.
-- After creating each file, move to the next one.
-- Do NOT try to create all files in a single bash block.
+STEP 2 — EXPLORE (if modifying existing code)
+- Read existing files with <read_file>path</read_file> to understand the codebase.
+- Use grep to find patterns and dependencies.
+- Use <context7_resolve library="name" query="..." /> to find library IDs.
+- Use <context7_query libraryId="/org/repo" query="..." /> to fetch documentation.
+- Understand before you change.
 
-STEP 3 — COMPILE / RUN
-- After creating all files, compile or run the project.
+STEP 3 — CREATE PROJECT FOLDER FIRST
+- For NEW projects: <create_dir>project-name</create_dir>
+- Then create all files inside that folder
+- Structure: `/workspace/<project-name>/venv/`, `/workspace/<project-name>/src/`
+
+STEP 4 — CREATE FILES USING FILE TOOLS
+- Use <write_file path="path/to/file">content</write_file> for creating files
+- Example:
+    <write_file path="myproject/main.py">
+    def hello():
+        print("Hello")
+    </write_file>
+- Do NOT use bash cat for file creation - use file tools instead.
+
+STEP 5 — INSTALL & BUILD (use bash for these)
 - For Python: use `uv` as the package manager.
-    - `uv init` to create a new project
+    - `cd /workspace/<project-name> && uv init` to create a new project
     - `uv add flask requests` to install packages
     - `uv run python main.py` to run
 - For C#: `dotnet build`
 - For Node: `npm install && npm run build`
 - For Go: `go build ./...`
 
-STEP 4 — FIX ERRORS (self-healing loop)
+STEP 6 — FIX ERRORS (self-healing loop)
 - If compilation fails, read the error carefully.
 - Fix the specific file that has the error.
 - Compile again. Repeat until it builds cleanly.
 - Do NOT give up after one error. Keep fixing.
 
-STEP 5 — VERIFY
+STEP 7 — VERIFY
 - Run the program or tests to confirm it works.
 - Show the output to the user.
+
+═══════════════════════════════════════════════════
+FILE OPERATIONS
+═══════════════════════════════════════════════════
+
+- Create files: cat << 'EOF' > filename
+- Read files: cat filename
+- Search: grep -rn "pattern" path/
+- List: ls -la path/ or tree path/
+- Modify: Write the complete updated file with cat << 'EOF'
 
 ═══════════════════════════════════════════════════
 FORMATTING

@@ -37,6 +37,10 @@ RUN apt-get update && apt-get install -y \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
+# Install Context7 CLI (documentation lookups for Plan mode)
+RUN npm install -g @upstash/context7-mcp && \
+    npx -y @upstash/context7-mcp --version || echo "Context7 npx fallback available"
+
 # Create workspace dir
 RUN mkdir -p /workspace
 
@@ -48,7 +52,8 @@ RUN echo "=== Toolchain ===" \
     && python3 --version \
     && node --version \
     && npm --version \
-    && uv --version
+    && uv --version \
+    && (ctx7 --version 2>/dev/null || echo "ctx7: using npx fallback")
 
 ENV TERM=xterm-256color
 ENV DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION=1
