@@ -165,7 +165,7 @@ public class FileTools
             var action = exists ? "modified" : "created";
 
             return new FileToolResult("write_file", true, 
-                $"✓ File {action}: {relativePath} ({size} chars written)",
+                $"File {action}: {relativePath} ({size} chars written)",
                 fullPath);
         }
         catch (Exception ex)
@@ -228,7 +228,7 @@ public class FileTools
 
             Directory.CreateDirectory(fullPath);
             return new FileToolResult("create_dir", true, 
-                $"✓ Directory created: {relativePath}",
+                $"Directory created: {relativePath}",
                 fullPath);
         }
         catch (Exception ex)
@@ -248,14 +248,14 @@ public class FileTools
             {
                 File.Delete(fullPath);
                 return new FileToolResult("delete_file", true, 
-                    $"✓ File deleted: {relativePath}",
+                    $"File deleted: {relativePath}",
                     fullPath);
             }
             else if (Directory.Exists(fullPath))
             {
                 Directory.Delete(fullPath, recursive: true);
                 return new FileToolResult("delete_file", true, 
-                    $"✓ Directory deleted: {relativePath}",
+                    $"Directory deleted: {relativePath}",
                     fullPath);
             }
             else

@@ -10,9 +10,10 @@ public class Database
 
     public Database()
     {
-        var workspace = Environment.GetEnvironmentVariable("WORKSPACE")
-            ?? Directory.GetCurrentDirectory();
-        var defaultDb = Path.Combine(workspace, "agent.db");
+        // Store agent.db in a dedicated data/ folder, separate from the workspace
+        var appDir = AppContext.BaseDirectory;
+        var dataDir = Path.Combine(appDir, "data");
+        var defaultDb = Path.Combine(dataDir, "agent.db");
         var dbPath = Environment.GetEnvironmentVariable("DB_PATH") ?? defaultDb;
 
         // Ensure directory exists

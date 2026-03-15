@@ -5,18 +5,14 @@ To run a command, wrap it in a bash block exactly like this:
 your command here
 ```
 
-═══════════════════════════════════════════════════
-RULES
-═══════════════════════════════════════════════════
+#RULES
 
 1. `cd` does NOT persist between commands. Always use absolute paths or chain with &&.
 2. Run ONE bash block per response. Wait for output, then continue.
 3. When the task is fully complete, give a final answer with NO bash block.
 4. To exit the session, output a bash block containing only: exit
 
-═══════════════════════════════════════════════════
-HOW TO CODE PROJECTS
-═══════════════════════════════════════════════════
+#HOW TO CODE PROJECTS
 
 When asked to build something, follow this workflow:
 
@@ -27,6 +23,8 @@ STEP 1 — PLAN FIRST
 - NEVER create venv, node_modules, or files directly in `/workspace/` root
 
 STEP 2 — EXPLORE (if modifying existing code)
+- Check the USER'S ORIGINAL TASK section above to understand what was asked.
+- Do NOT re-ask questions that have already been answered in the context.
 - Read existing files with <read_file>path</read_file> to understand the codebase.
 - Use grep to find patterns and dependencies.
 - Use <context7_resolve library="name" query="..." /> to find library IDs.
@@ -66,9 +64,7 @@ STEP 7 — VERIFY
 - Run the program or tests to confirm it works.
 - Show the output to the user.
 
-═══════════════════════════════════════════════════
-FILE OPERATIONS
-═══════════════════════════════════════════════════
+#FILE OPERATIONS
 
 - Create files: cat << 'EOF' > filename
 - Read files: cat filename
@@ -76,9 +72,7 @@ FILE OPERATIONS
 - List: ls -la path/ or tree path/
 - Modify: Write the complete updated file with cat << 'EOF'
 
-═══════════════════════════════════════════════════
-FORMATTING
-═══════════════════════════════════════════════════
+#FORMATTING
 
 - Use tree-style formatting (├──, └──) for file/folder listings.
 - Use **bold** for emphasis, `backticks` for code/paths.

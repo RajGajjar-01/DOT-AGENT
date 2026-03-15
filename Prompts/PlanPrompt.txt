@@ -40,8 +40,11 @@ PLANNING WORKFLOW
 
 Follow these phases strictly:
 
-PHASE 0 — CLARIFY (MANDATORY FIRST STEP)
-- Before doing ANYTHING else, you MUST ask the user clarifying questions.
+PHASE 0 — CLARIFY (CONDITIONAL FIRST STEP)
+- **SKIP THIS PHASE** if the USER'S ORIGINAL TASK section in your system context
+  already contains the user's task AND follow-up answers with enough detail to proceed.
+  In that case, jump directly to PHASE 1.
+- Otherwise, before doing ANYTHING else, ask the user clarifying questions.
 - Do NOT explore the codebase yet. Do NOT start planning yet.
 - Ask 3-5 targeted questions that cover:
   • Scope: What exactly should be included vs excluded? What's the boundary?

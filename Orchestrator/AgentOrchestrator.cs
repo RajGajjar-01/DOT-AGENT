@@ -17,6 +17,7 @@ public class AgentOrchestrator
     private readonly FileTools _fileTools;
     private readonly Context7Tools _context7Tools;
     private readonly DocCache _docCache;  // Shared instance
+    private readonly PromptEnhancer _promptEnhancer;
 
     private readonly string _workspaceRoot;
 
@@ -52,6 +53,7 @@ public class AgentOrchestrator
         _fileTools = new FileTools();
         _docCache = new DocCache();  // Single shared instance
         _context7Tools = new Context7Tools(_docCache);  // Reuse shared cache
+        _promptEnhancer = new PromptEnhancer(llm);
 
         var root = Environment.GetEnvironmentVariable("WORKSPACE")
             ?? Directory.GetCurrentDirectory();
@@ -261,6 +263,44 @@ public class AgentOrchestrator
                 continue;
             }
 
+            // ── Prompt Enhancement ──────────────────────────────────
+            var enhancedInput = userInput;
+            try
+            {
+                var (enhanced, wasEnhanced) = await AnsiConsole.Status()
+                    .Spinner(Spinner.Known.Dots2)
+                    .SpinnerStyle(Style.Parse(Gold))
+                    .StartAsync($"[{GoldDim}]enhancing prompt...[/]", async _ =>
+                    {
+                        return await _promptEnhancer.EnhanceAsync(userInput, ct);
+                    });
+
+                if (wasEnhanced)
+                {
+                    AnsiConsole.MarkupLine($"  [{Gold}]✦ Enhanced prompt:[/]");
+                    AnsiConsole.WriteLine();
+
+                    // Show enhanced prompt in a panel
+                    AnsiConsole.Write(
+                        new Panel(new Markup($"[{GoldLit}]{Markup.Escape(enhanced)}[/]"))
+                            .Header($"[{Gold} bold] enhanced [/]")
+                            .Border(BoxBorder.Rounded)
+                            .BorderColor(new Color(240, 170, 0))
+                            .Padding(1, 0));
+                    AnsiConsole.WriteLine();
+
+                    var useEnhanced = AnsiConsole.Confirm(
+                        $"  [{Gold}]Use enhanced prompt?[/]", defaultValue: true);
+
+                    if (useEnhanced)
+                        enhancedInput = enhanced;
+                }
+            }
+            catch
+            {
+                // Enhancement failed silently — use original
+            }
+
             // Check if we have an approved plan before allowing execute mode
             var existingPlan = _db.GetPlan(_session!.Id);
             if (string.IsNullOrWhiteSpace(existingPlan))
@@ -272,7 +312,7 @@ public class AgentOrchestrator
                 {
                     SessionId = _session.Id,
                     Role      = "user",
-                    Content   = userInput
+                    Content   = enhancedInput
                 };
                 _history.Add(planMsg);
                 _db.SaveMessage(planMsg);
@@ -286,7 +326,7 @@ public class AgentOrchestrator
             {
                 SessionId = _session!.Id,
                 Role      = "user",
-                Content   = userInput
+                Content   = enhancedInput
             };
             _history.Add(msg);
             _db.SaveMessage(msg);
@@ -370,13 +410,44 @@ Continue from where you left off. Do NOT recreate existing files.
 """;
         }
 
+        // Inject user's original task so the agent never forgets what was asked
+        var userTask = _history.FirstOrDefault(m => m.Role == "user")?.Content;
+        var taskContext = "";
+        if (!string.IsNullOrWhiteSpace(userTask))
+        {
+            // Also collect clarification answers (subsequent user messages before the plan)
+            var clarificationAnswers = _history
+                .Where(m => m.Role == "user")
+                .Skip(1)  // skip the first (original task)
+                .Take(3)  // at most 3 follow-up answers
+                .Select(m => m.Content)
+                .ToList();
+
+            var answersSection = clarificationAnswers.Count > 0
+                ? "\n\nUser's follow-up answers:\n" + string.Join("\n---\n", clarificationAnswers)
+                : "";
+
+            taskContext = $"""
+
+═══════════════════════════════════════════════════
+USER'S ORIGINAL TASK
+═══════════════════════════════════════════════════
+
+{userTask}{answersSection}
+
+IMPORTANT: This is what the user originally asked for.
+Do NOT re-ask clarifying questions that have already been answered.
+If you already have enough information, proceed to exploration or planning.
+""";
+        }
+
         // Dynamic timestamp at the very end (won't break cache for the prefix)
         var timestamp = $"""
 
 Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
 """;
 
-        return basePrompt + staticEnv + plannedContext + fileContext + timestamp;
+        return basePrompt + staticEnv + taskContext + plannedContext + fileContext + timestamp;
     }
 
 
@@ -412,8 +483,8 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
 
             try
             {
-                var contextWindow = _history.Count > 5
-                    ? _history[^5..]  // Reduced from 10 to 5 for faster responses
+                var contextWindow = _history.Count > 20
+                    ? _history[^20..]
                     : _history;
 
                 (llmResponse, usage, metrics) = await AnsiConsole.Status()
@@ -720,7 +791,8 @@ Current time: {DateTime.Now:yyyy-MM-dd HH:mm}
             bool confirmed;
 
             // ── Sandbox: restrict bash commands to workspace only ──
-            if (!IsCommandWorkspaceSafe(command, out var sandboxReason))
+            // Read-only commands are safe even if they reference system paths
+            if (!IsReadOnlyCommand(command) && !IsCommandWorkspaceSafe(command, out var sandboxReason))
             {
                 AnsiConsole.MarkupLine($"  [red bold]✗ Blocked:[/] [dim]Command is outside workspace sandbox[/]");
                 AnsiConsole.MarkupLine($"  [dim]Reason: {Markup.Escape(sandboxReason)}[/]");
